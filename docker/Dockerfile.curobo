@@ -33,6 +33,11 @@ ENV ISAACLAB_PATH=${ISAACLAB_PATH_ARG}
 # Home dir of the runtime docker user, typically '/root'
 ARG DOCKER_USER_HOME_ARG
 ENV DOCKER_USER_HOME=${DOCKER_USER_HOME_ARG}
+# UID and GID of the host user for writable bind mounts.
+ARG DOCKER_USER_UID_ARG=1000
+ARG DOCKER_USER_GID_ARG=1000
+ENV DOCKER_USER_UID=${DOCKER_USER_UID_ARG}
+ENV DOCKER_USER_GID=${DOCKER_USER_GID_ARG}
 ENV HOME=${DOCKER_USER_HOME}
 
 # Set environment variables
@@ -130,11 +135,10 @@ RUN touch /bin/nvidia-smi && \
 # Created before the venv so the install layers can set ownership as they write, instead of
 # a recursive chown afterwards: on overlayfs a chown copies up every file it touches, which
 # costs both build time and a duplicate of the venv in the image.
-# The uid/gid 1000 match GitHub runner bind mounts used by the cuRobo tests.
-# --non-unique is required because some base image revisions already carry
-# another user or group at uid/gid 1000.
-RUN groupadd --non-unique --gid 1000 isaaclab \
- && useradd --non-unique --uid 1000 --gid 1000 -M -l -s /bin/bash -d ${DOCKER_USER_HOME} isaaclab
+# --non-unique allows matching arbitrary host IDs, including IDs already
+# present in a base image.
+RUN groupadd --non-unique --gid ${DOCKER_USER_GID} isaaclab \
+ && useradd --non-unique --uid ${DOCKER_USER_UID} --gid ${DOCKER_USER_GID} -M -l -s /bin/bash -d ${DOCKER_USER_HOME} isaaclab
 
 # copy files necessary for installing Isaac Lab and its dependencies
 # this way we minimize the chance of cache invalidation on file edits

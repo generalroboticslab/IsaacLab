@@ -104,8 +104,12 @@ def test_non_root_runtime_dockerfiles(dockerfile: Path):
 def test_dockerfile_creates_non_root_runtime_user(dockerfile_name: str):
     dockerfile_text = _find_dockerfile(dockerfile_name).read_text(encoding="utf-8")
 
-    assert re.search(r"\bgroupadd\b.*--gid\s+1000\b.*\bisaaclab\b", dockerfile_text, re.DOTALL)
-    assert re.search(r"\buseradd\b.*--uid\s+1000\b.*--gid\s+1000\b.*\bisaaclab\b", dockerfile_text, re.DOTALL)
+    assert re.search(r"\bgroupadd\b.*--gid\s+\$\{DOCKER_USER_GID\}.*\bisaaclab\b", dockerfile_text, re.DOTALL)
+    assert re.search(
+        r"\buseradd\b.*--uid\s+\$\{DOCKER_USER_UID\}.*--gid\s+\$\{DOCKER_USER_GID\}.*\bisaaclab\b",
+        dockerfile_text,
+        re.DOTALL,
+    )
     assert "USER isaaclab" in dockerfile_text
 
 
