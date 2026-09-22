@@ -1,0 +1,3 @@
+[submodule "source/isaaclab_tasks/isaaclab_tasks/contrib/lappv2"]
+	path = source/isaaclab_tasks/isaaclab_tasks/contrib/lappv2
+	url = git@github.com:generalroboticslab/lappv2.git
