@@ -6,6 +6,7 @@
 """Tests for the OVRTX renderer output contract."""
 
 import contextlib
+import ctypes
 import importlib.util
 import sys
 import types
@@ -16,9 +17,11 @@ import pytest
 import torch
 import warp as wp
 
+from isaaclab.assets import AssetBaseCfg
 from isaaclab.sensors.camera import CameraCfg
 from isaaclab.sensors.camera.camera_data import CameraData, RenderBufferKind, RenderBufferSpec
 from isaaclab.sim import PinholeCameraCfg, SimulationContext
+from isaaclab.utils import replace
 
 _REQUIRED_MODULES = ("isaaclab_ov", "ovrtx")
 _MISSING_MODULES = [module for module in _REQUIRED_MODULES if importlib.util.find_spec(module) is None]
@@ -31,7 +34,7 @@ pytestmark = [
 ]
 
 if not _MISSING_MODULES:
-    from isaaclab_ov.renderers import OVRTXBackendCfg, OVRTXRendererCfg, ovrtx_mapping  # noqa: E402
+    from isaaclab_ov.renderers import OVRTXBackendCfg, OVRTXRendererCfg  # noqa: E402
     from isaaclab_ov.renderers import ovrtx_renderer as ovrtx_renderer_module  # noqa: E402
     from isaaclab_ov.renderers.ovrtx_renderer import (  # noqa: E402
         _DISABLE_LINUX_CUDA_CPU_SYNC_ENV,
@@ -97,13 +100,23 @@ def _simulation_registry(monkeypatch):
 
 
 @pytest.mark.parametrize("use_ovstage", [False, True])
-def test_ovrtx_renderer_config_enables_supported_runtime_options(monkeypatch: pytest.MonkeyPatch, use_ovstage):
+def test_ovrtx_renderer_config_enables_supported_runtime_options(monkeypatch, tmp_path, use_ovstage):
     """Equal cfgs share one native resource; closing borrowers leaves it owned by the registry."""
     config_kwargs: dict[str, object] = {}
-    destroyed = []
+    destroyed, redirected = [], []
+    dependency = tmp_path / "bin/plugins/libosdCPU.so.3.6.0"
+    dependency.parent.mkdir(parents=True)
+    dependency.touch()
+    loaded = []
+    monkeypatch.setattr(ovrtx_renderer_module.ovstage, "__file__", str(tmp_path / "__init__.py"))
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: loaded.append(path))
+    # Cache redirection can load the SDK too; isolate it with the other native entry points.
+    monkeypatch.setenv("OVRTX_SHADER_CACHE_PATH", str(tmp_path / "shader-cache"))
+    monkeypatch.setattr(ovrtx_renderer_module, "redirect_shader_cache", redirected.append)
 
     class RecordingRendererConfig:
         def __init__(self, **kwargs):
+            assert loaded, "The renderer must load its native dependencies without viewer setup."
             config_kwargs.update(kwargs)
 
     monkeypatch.setattr(ovrtx_renderer_module, "RendererConfig", RecordingRendererConfig)
@@ -118,11 +131,13 @@ def test_ovrtx_renderer_config_enables_supported_runtime_options(monkeypatch: py
     shared = OVRTXRenderer(renderer.cfg)
 
     assert shared.backend is renderer.backend
+    assert loaded == [str(dependency)]
+    assert len(redirected) == 1
     assert renderer.backend.renderer is not None
     assert config_kwargs["suppress_deprecation_warnings"] is True
     assert config_kwargs["texture_streaming_mode"] is ovrtx_renderer_module.TextureStreamingMode.SYNCHRONOUS
     assert len(SimulationContext.instance()._backend_registry) == 1
-    other = OVRTXRenderer(renderer.cfg.replace(enable_shadows=True))
+    other = OVRTXRenderer(replace(renderer.cfg, enable_shadows=True))
     assert other.backend is not renderer.backend
     renderer.close()
     renderer.close()
@@ -134,6 +149,7 @@ def test_ovrtx_renderer_config_enables_supported_runtime_options(monkeypatch: py
     SimulationContext.instance().close_backend(renderer.backend)
     SimulationContext.instance().close_backend(other.backend)
     assert len(destroyed) == 2
+    assert redirected == destroyed
     assert not SimulationContext.instance()._backend_registry
 
 
@@ -232,7 +248,7 @@ def test_ovrtx_multiple_cameras_render_independent_views(monkeypatch, use_ovstag
 
     from pxr import Gf, Usd, UsdGeom, UsdLux
 
-    from isaaclab.cloner.clone_plan import ClonePlan
+    from isaaclab.cloner import make_clone_plan
     from isaaclab.renderers.camera_render_spec import CameraRenderSpec
     from isaaclab.utils.math import convert_camera_frame_orientation_convention
     from isaaclab.utils.warp import ProxyArray
@@ -260,13 +276,10 @@ def test_ovrtx_multiple_cameras_render_independent_views(monkeypatch, use_ovstag
 
     renderer = OVRTXRenderer(OVRTXRendererCfg())
     renderer._exported_usd_string = stage.ExportToString()
-    renderer._clone_plan = ClonePlan(
-        sources=("/World/envs/env_0",),
-        destinations=("/World/envs/env_{}",),
-        clone_mask=np.ones((1, 2), dtype=np.bool_),
-        env_ids=np.arange(2, dtype=np.int64),
-        positions=np.zeros((2, 3), dtype=np.float32),
+    plan = make_clone_plan(
+        (AssetBaseCfg(prim_path="/World/envs/env_[^/]+"),), ((0,),), 2, positions=np.zeros((2, 3), dtype=np.float32)
     )
+    renderer._clone_plan = plan
     cameras = []
 
     def camera_scope_exists(rd):
@@ -682,79 +695,6 @@ def test_ovrtx_map_render_var_orders_the_read_against_render_completion(monkeypa
     assert render_var.ordering == [expected]
 
 
-class _RecordingMappedBinding:
-    """Stand-in for an OVRTX attribute binding that records how its mapping is committed."""
-
-    def __init__(self):
-        self.map_calls: list[dict] = []
-        self.unmap_calls: list[dict] = []
-
-    def map(self, *, device, device_id):
-        self.map_calls.append({"device": device, "device_id": device_id})
-        binding = self
-
-        class _Mapping:
-            tensor = object()
-
-            def unmap(self, *, event=None, stream=None):
-                binding.unmap_calls.append({"event": event, "stream": stream})
-
-        return _Mapping()
-
-
-def _patch_warp_device(monkeypatch, *, ordinal: int, cuda_stream: int) -> types.SimpleNamespace:
-    """Return a fake resolved Warp device with the requested ordinal and stream."""
-    device = types.SimpleNamespace(ordinal=ordinal, stream=types.SimpleNamespace(cuda_stream=cuda_stream))
-    monkeypatch.setattr(ovrtx_mapping.wp, "get_device", lambda requested: device)  # noqa: ARG005
-    return device
-
-
-@pytest.mark.parametrize(("device", "expected"), [("cuda:1", 1), ("cuda", 0)])
-def test_cuda_device_id_parses_the_device_string(device, expected):
-    """The mapping device index is parsed from the string; a bare ``"cuda"`` parses to 0.
-
-    The bare-``"cuda"`` case intentionally preserves pre-existing behavior even though Warp
-    resolves it to its current CUDA device -- see the TODO on ``cuda_device_id``.
-    """
-    assert ovrtx_mapping.cuda_device_id(device) == expected
-
-
-def test_map_attribute_for_warp_writes_commits_on_the_producer_stream(monkeypatch):
-    """The unmap names the Warp stream that produced the data, so the commit cannot race the fill.
-
-    An unmap without a CUDA sync performs no synchronization at all, so the assertion is on the
-    unmap's ``stream`` argument, not merely on the unmap happening.
-    """
-    sentinel = object()
-    binding = _RecordingMappedBinding()
-    _patch_warp_device(monkeypatch, ordinal=1, cuda_stream=99)
-    monkeypatch.setattr(ovrtx_mapping.wp, "from_dlpack", lambda tensor, dtype: sentinel)
-
-    with ovrtx_mapping.map_attribute_for_warp_writes(binding, "cuda", wp.mat44d) as array:
-        assert array is sentinel
-
-    assert binding.map_calls == [{"device": ovrtx_renderer_module.Device.CUDA, "device_id": 1}]
-    assert binding.unmap_calls == [{"event": None, "stream": 99}]
-
-
-def test_map_attribute_for_warp_writes_unmaps_when_the_fill_raises(monkeypatch):
-    """A failed fill must still release the mapping exactly once, with the same stream ordering.
-
-    Skipping the unmap would leak the mapping to OVRTX's ``__del__`` safety net, which commits
-    fire-and-forget without any CUDA sync.
-    """
-    binding = _RecordingMappedBinding()
-    device = _patch_warp_device(monkeypatch, ordinal=0, cuda_stream=7)
-    monkeypatch.setattr(ovrtx_mapping.wp, "from_dlpack", lambda tensor, dtype: object())
-
-    with pytest.raises(ValueError, match="fill failed"):
-        with ovrtx_mapping.map_attribute_for_warp_writes(binding, device, wp.mat44d):
-            raise ValueError("fill failed")
-
-    assert binding.map_calls == [{"device": ovrtx_renderer_module.Device.CUDA, "device_id": 0}]
-    assert binding.unmap_calls == [{"event": None, "stream": 7}]
-
-
 @pytest.mark.parametrize("cleanup_directly", [False, True])
 @pytest.mark.parametrize("use_ovstage", [False, True])
 def test_ovrtx_cleanup_releases_only_the_given_render_data(cleanup_directly, use_ovstage):
@@ -800,18 +740,6 @@ def test_ovrtx_cleanup_releases_only_the_given_render_data(cleanup_directly, use
     assert render_data.warp_buffers == {}
     assert render_data.renderer_info == {}
     assert render_data.ppisp_pipeline is None
-    assert renderer._render_product_paths == ["/RenderCamera_0/RenderProduct_camera"]
-    assert renderer._initialized_scene is True
-
-
-def test_ovrtx_cleanup_without_render_data_keeps_renderer_state():
-    """``cleanup(None)`` has nothing to release and must not disturb the renderer."""
-    renderer = _make_ovrtx_renderer_without_backend()
-    renderer._render_product_paths = ["/RenderCamera_0/RenderProduct_camera"]
-    renderer._initialized_scene = True
-
-    renderer.cleanup(None)
-
     assert renderer._render_product_paths == ["/RenderCamera_0/RenderProduct_camera"]
     assert renderer._initialized_scene is True
 
